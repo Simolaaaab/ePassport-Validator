@@ -1,0 +1,5 @@
+asn1crypto==1.5.1
+cffi==2.0.0
+cryptography==46.0.3
+pycparser==2.23
+pyscard==2.3.1
