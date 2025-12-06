@@ -7,7 +7,7 @@ from Crypto.Random import get_random_bytes
 from Crypto.Util.strxor import strxor
 
 # ==========================================
-# 1. I TUOI DATI MRZ
+# 1. I TUOI DATI (MRZ)
 # ==========================================
 PASSPORT_NO = "YC6096319"
 CHECK_NO    = "6"
@@ -17,11 +17,17 @@ EXPIRY      = "340714"
 CHECK_EXP   = "9"
 
 # ==========================================
-# 2. IMPLEMENTAZIONE SECURE MESSAGING
+# 2. FUNZIONI CRITTOGRAFICHE DI BASE
 # ==========================================
 
+def derive_key(seed, mode):
+    """Deriva le chiavi (Kenc/Kmac) dal Seed usando SHA-1"""
+    c = bytes([0, 0, 0, mode])
+    d = hashlib.sha1(seed + c).digest()
+    return d[:8] + d[8:16]
+
 def pad(data):
-    """Padding ISO 9797-1 Method 2 (80 00...)"""
+    """Padding ISO per il MAC (80 00...)"""
     return data + b'\x80' + b'\x00' * (7 - (len(data) % 8))
 
 def unpad(data):
@@ -48,6 +54,10 @@ def calc_mac(key, data):
     step1 = DES.new(ka, DES.MODE_CBC, bytes([0]*8)).encrypt(data)[-8:]
     step2 = DES.new(kb, DES.MODE_ECB).decrypt(step1)
     return DES.new(ka, DES.MODE_ECB).encrypt(step2)
+
+# ==========================================
+# 3. CLASSE SECURE CHANNEL (Per leggere i file)
+# ==========================================
 
 class SecureChannel:
     def __init__(self, connection, ks_enc, ks_mac, ssc):
@@ -84,10 +94,12 @@ class SecureChannel:
         # Costruzione comando finale
         final_data = do_data + do_le + do_mac
         
-        # FIX IMPORTANTE: Aggiungiamo [0x00] SOLO se ci aspettiamo dati (Le != None)
+        # FIX FONDAMENTALE PER ERRORE 0x6988:
+        # Aggiungiamo il byte finale [0x00] SOLO se ci aspettiamo una risposta (le != None).
+        # Per il comando "Select File", le è None, quindi NON mettiamo 0x00.
         apdu = [cla | 0x0C, ins, p1, p2, len(final_data)] + list(final_data)
         if le is not None:
-            apdu += [0x00] # Transport Le byte
+            apdu += [0x00] 
             
         return apdu
 
@@ -124,7 +136,7 @@ class SecureChannel:
     def read_file(self, file_id):
         print(f"[*] Lettura File ID {hex(file_id)}...")
         
-        # 1. Select File (Nota: le=None qui!)
+        # 1. Select File (Nota: le=None qui! Questo evita l'errore 0x6988)
         p1, p2 = (file_id >> 8) & 0xFF, file_id & 0xFF
         cmd = self.protect_apdu(0x00, 0xA4, 0x02, 0x0C, bytes([p1, p2]), le=None)
         
@@ -164,68 +176,126 @@ class SecureChannel:
             
         return full_data
 
+def send_apdu(connection, apdu):
+    resp, sw1, sw2 = connection.transmit(apdu)
+    sw = (sw1 << 8) + sw2
+    return resp, sw
+
 # ==========================================
-# 3. MAIN
+# 4. MAIN (LA TUA LOGICA + IL DOWNLOAD)
 # ==========================================
+
 def main():
+    print("="*60)
+    print("   FUSIONE SCRIPT: CALCOLO CHIAVI + DOWNLOAD FILE")
+    print("="*60)
+
+    # --- FASE 1: Calcolo Chiavi MRZ (Access Keys) ---
+    mrz_info = f"{PASSPORT_NO}{CHECK_NO}{DOB}{CHECK_DOB}{EXPIRY}{CHECK_EXP}"
+    k_seed_mrz = hashlib.sha1(mrz_info.encode('utf-8')).digest()[:16]
+    k_enc = derive_key(k_seed_mrz, 1)
+    k_mac = derive_key(k_seed_mrz, 2)
     
+    print(f"[*] Access Keys (da MRZ):")
+    print(f"    K_enc: {toHexString(list(k_enc))}")
+    print(f"    K_mac: {toHexString(list(k_mac))}")
+
+    # --- FASE 2: Connessione ---
     r = readers()
-    if not r: sys.exit("No Reader")
-    conn = r[0].createConnection()
-    conn.connect()
+    if not r: sys.exit("Nessun lettore")
+    connection = r[0].createConnection()
+    connection.connect()
+
+    # --- FASE 3: Handshake BAC ---
+    # Select Applet
+    send_apdu(connection, [0x00, 0xA4, 0x04, 0x0C, 0x07, 0xA0, 0x00, 0x00, 0x02, 0x47, 0x10, 0x01])
     
-    conn.transmit([0x00, 0xA4, 0x04, 0x0C, 0x07, 0xA0, 0x00, 0x00, 0x02, 0x47, 0x10, 0x01])
-    resp, sw1, sw2 = conn.transmit([0x00, 0x84, 0x00, 0x00, 0x08]) 
-    
-    rnd_icc = bytes(resp)
+    # Get Challenge (Ricevi RND.ICC)
+    resp, _ = send_apdu(connection, [0x00, 0x84, 0x00, 0x00, 0x08])
+    rnd_icc = bytes(resp) # 8 bytes
+
+    # Genera i nostri segreti
     rnd_ifd = get_random_bytes(8)
-    k_ifd = get_random_bytes(16)
+    k_ifd   = get_random_bytes(16)
     
+    # Prepara pacchetto cifrato
     plaintext = rnd_ifd + rnd_icc + k_ifd
     iv = bytes([0]*8)
     e_ifd = DES3.new(k_enc, DES3.MODE_CBC, iv).encrypt(plaintext)
     
-    mac_data = pad(e_ifd)
+    # Calcolo MAC
+    mac_input = pad(e_ifd)
     k_mac_a, k_mac_b = k_mac[:8], k_mac[8:16]
-    step1 = DES.new(k_mac_a, DES.MODE_CBC, iv).encrypt(mac_data)[-8:]
-    step2 = DES.new(k_mac_b, DES.MODE_ECB).decrypt(step1)
-    m_ifd = DES.new(k_mac_a, DES.MODE_ECB).encrypt(step2)
-    
-    cmd_auth = [0x00, 0x82, 0x00, 0x00, 0x28] + list(e_ifd) + list(m_ifd) + [0x00]
-    
-    resp, sw1, sw2 = conn.transmit(cmd_auth)
-    sw = (sw1 << 8) + sw2
-    
-    if sw != 0x9000:
-        print(f"❌ Auth Fallita: {hex(sw)}")
-        return
+    mac_temp = DES.new(k_mac_a, DES.MODE_CBC, iv).encrypt(mac_input)[-8:]
+    mac_temp = DES.new(k_mac_b, DES.MODE_ECB).decrypt(mac_temp)
+    m_ifd    = DES.new(k_mac_a, DES.MODE_ECB).encrypt(mac_temp)
 
-    e_icc = bytes(resp)[:32]
-    decrypted_resp = DES3.new(k_enc, DES3.MODE_CBC, bytes([0]*8)).decrypt(e_icc)
-    k_icc = decrypted_resp[16:32]
-    k_seed_session = strxor(k_ifd, k_icc)
+    # INVIA MUTUAL AUTHENTICATE
+    cmd = [0x00, 0x82, 0x00, 0x00, 0x28] + list(e_ifd) + list(m_ifd) + [0x00]
+    resp_list, sw = send_apdu(connection, cmd) # Corretto per prendere 2 valori qui
+
+    if sw != 0x9000:
+        print(f"❌ Auth Fallita con codice {hex(sw)}")
+        sys.exit(1)
+        
+    print("✅ Auth OK! Ora calcoliamo le Session Keys (Metodo Tuo)...")
+
+    # --- DECIFRATURA RISPOSTA (IL TUO CODICE) ---
+    resp_data = bytes(resp_list)
+    if len(resp_data) < 32:
+        print("Errore: Risposta troppo corta dal passaporto.")
+        sys.exit()
+
+    e_icc = resp_data[:32] # La parte cifrata
     
-    ks_enc = hashlib.sha1(k_seed_session + c_enc).digest()[:16]
-    ks_mac = hashlib.sha1(k_seed_session + c_mac).digest()[:16]
-    ssc = rnd_icc[-4:] + rnd_ifd[-4:] 
+    # Decifriamo la risposta usando K_enc (MRZ)
+    iv_resp = bytes([0]*8) 
+    decryptor = DES3.new(k_enc, DES3.MODE_CBC, iv_resp)
+    decrypted_response = decryptor.decrypt(e_icc)
     
-    print("✅ Secure Messaging Stabilito.")
+    # Troviamo K.ICC
+    found_k_icc = decrypted_response[16:32]
     
-    sc = SecureChannel(conn, ks_enc, ks_mac, ssc)
+    # --- CALCOLO CHIAVI SESSIONE FINALI ---
+    # K_seed = K_IFD XOR K_ICC
+    k_seed_session = strxor(k_ifd, found_k_icc)
     
-    # SCARICA DG1
+    # Derive KS
+    ks_enc = derive_key(k_seed_session, 1)
+    ks_mac = derive_key(k_seed_session, 2)
+    
+    # Calcolo SSC
+    ssc = rnd_icc[-4:] + rnd_ifd[-4:]
+
+    print("-" * 50)
+    print("🔑 CHIAVI DI SESSIONE ATTIVE:")
+    print(f"KS_enc: {toHexString(list(ks_enc))}")
+    print(f"KS_mac: {toHexString(list(ks_mac))}")
+    print(f"SSC:    {toHexString(list(ssc))}")
+    print("-" * 50)
+    
+    # ==========================================================
+    # ORA USIAMO QUESTE CHIAVI PER SCARICARE I FILE!
+    # ==========================================================
+    
+    print("\n⬇️ AVVIO DOWNLOAD FILE CON SECURE MESSAGING...")
+    
+    # Inizializziamo il canale sicuro con le chiavi appena calcolate
+    sc = SecureChannel(connection, ks_enc, ks_mac, ssc)
+    
+    # SCARICA DG1 (ID: 0x0101)
     dg1_data = sc.read_file(0x0101)
     if dg1_data:
         with open("dg1.bin", "wb") as f: f.write(dg1_data)
         print(f"✅ DG1 salvato (dg1.bin): {len(dg1_data)} bytes")
     
-    # SCARICA SOD
+    # SCARICA SOD (ID: 0x011D)
     sod_data = sc.read_file(0x011D)
     if sod_data:
         with open("sod.bin", "wb") as f: f.write(sod_data)
         print(f"✅ SOD salvato (sod.bin): {len(sod_data)} bytes")
 
-    print("\nFatto! File salvati.")
+    print("\n🎉 COMPLETATO! Controlla la cartella.")
 
 if __name__ == "__main__":
     main()
