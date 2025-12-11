@@ -1,48 +1,50 @@
 import os
-import hashlib
+import json
 from asn1crypto import cms, x509, core
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509 import load_pem_x509_certificate, load_der_x509_certificate
+from cryptography.x509 import load_pem_x509_crl, load_der_x509_crl # <--- NUOVO IMPORT
 
-# --- COLORI PER LA CONSOLE (Corretti e Completi) ---
+# --- COLORI ---
 class Colors:
     HEADER = '\033[95m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
     GREEN = '\033[92m'
-    YELLOW = '\033[93m'   # <--- AGGIUNTO
-    MAGENTA = '\033[95m'  # <--- AGGIUNTO
+    YELLOW = '\033[93m'
+    MAGENTA = '\033[95m'
     WARNING = '\033[93m'
     FAIL = '\033[91m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
 
-# --- DEFINIZIONI ASN.1 ---
+# --- ASN.1 ---
 class DataGroupHash(core.Sequence):
-    _fields = [
-        ('data_group_number', core.Integer),
-        ('data_group_hash_value', core.OctetString)
-    ]
-
+    _fields = [('dg_num', core.Integer), ('dg_hash', core.OctetString)]
 class DataGroupHashValues(core.SequenceOf):
     _child_spec = DataGroupHash
-
 class LDSSecurityObject(core.Sequence):
-    _fields = [
-        ('version', core.Integer),
-        ('hash_algorithm', x509.AlgorithmIdentifier),
-        ('datagroup_hash_values', DataGroupHashValues)
-    ]
+    _fields = [('version', core.Integer), ('hash_algo', x509.AlgorithmIdentifier), ('dg_hashes', DataGroupHashValues)]
 
 class PassiveValidator:
-    def __init__(self, dg1_path, dg2_path, sod_path, csca_folder):
+    def __init__(self, dg1_path, dg2_path, sod_path, csca_folder, crl_path): # <--- AGGIUNTO crl_path
         self.dg1_path = dg1_path
         self.dg2_path = dg2_path
         self.sod_path = sod_path
         self.csca_folder = csca_folder
-        self.ds_cert = None 
+        self.crl_path = crl_path # <--- SALVATO
+        
+        self.report = {
+            "passport_structure": {"algorithm": None, "sod_present": False},
+            "integrity_check": {},
+            "digital_signature": {},
+            "chain_of_trust": {},
+            "revocation_status": "NOT CHECKED", # <--- NUOVO CAMPO
+            "final_verdict": "UNKNOWN"
+        }
+
         self.algo_map = {
             'sha1': hashes.SHA1(), 'sha224': hashes.SHA224(), 'sha256': hashes.SHA256(),
             'sha384': hashes.SHA384(), 'sha512': hashes.SHA512(),
@@ -52,12 +54,8 @@ class PassiveValidator:
         }
 
     def _print_hex(self, label, data, color=Colors.CYAN):
-        """Stampa carina di dati esadecimali"""
-        if data is None:
-            print(f"   {label:<25} {Colors.FAIL}NONE{Colors.ENDC}")
-            return
+        if data is None: return
         hex_str = data.hex().upper()
-        # Taglia se troppo lungo per la console
         short_hex = hex_str[:32] + "..." if len(hex_str) > 32 else hex_str
         print(f"   {label:<25} {color}{short_hex}{Colors.ENDC}")
 
@@ -72,7 +70,6 @@ class PassiveValidator:
     def _unwrap_sod(self, raw_data):
         if not raw_data: return raw_data
         if raw_data[0] == 0x30: return raw_data
-        # Logica rimozione wrapper (condensata)
         idx = 1
         if raw_data[0] == 0x77:
             if raw_data[idx] < 0x80: idx += 1
@@ -86,163 +83,170 @@ class PassiveValidator:
 
     def run(self):
         print(f"{Colors.HEADER}{Colors.BOLD}\n=== SISTEMA DI VERIFICA PASSAPORTO ELETTRONICO (ICAO 9303) ==={Colors.ENDC}")
-        print(f"Directory CSCA: {self.csca_folder}")
         
         # --- CARICAMENTO SOD ---
         try:
             with open(self.sod_path, 'rb') as f: sod_raw = self._unwrap_sod(f.read())
             content_info = cms.ContentInfo.load(sod_raw)
             signed_data = content_info['content']
+            self.report["passport_structure"]["sod_present"] = True
         except Exception as e:
             print(f"{Colors.FAIL}Errore parsing SOD: {e}{Colors.ENDC}")
             return
 
         # ---------------------------------------------------------
-        # STEP 1: VERIFICA INTEGRITÀ (VISIVA)
+        # STEP 1: INTEGRITÀ
         # ---------------------------------------------------------
-        print(f"\n{Colors.BLUE}{Colors.BOLD}[STEP 1] VERIFICA INTEGRITÀ DATI (Passive Authentication){Colors.ENDC}")
-        print("Confronto tra Hash calcolati dai file locali e Hash firmati nel SOD:")
-        
+        print(f"\n{Colors.BLUE}{Colors.BOLD}[STEP 1] VERIFICA INTEGRITÀ DATI{Colors.ENDC}")
         try:
             encap_content = signed_data['encap_content_info']['content'].native
             lds_obj = LDSSecurityObject.load(encap_content)
-            sod_algo_oid = lds_obj['hash_algorithm']['algorithm'].native
-            
-            stored_hashes = {item['data_group_number'].native: item['data_group_hash_value'].native 
-                             for item in lds_obj['datagroup_hash_values']}
+            sod_algo_oid = lds_obj['hash_algo']['algorithm'].native
+            self.report["passport_structure"]["algorithm"] = sod_algo_oid
+            stored_hashes = {item['dg_num'].native: item['dg_hash'].native for item in lds_obj['dg_hashes']}
 
-            # Helper per stampare il confronto
-            def check_dg(dg_num, path, label):
-                if dg_num in stored_hashes:
-                    local_hash = self._calc_hash(path, sod_algo_oid)
-                    print(f"\n   --- Analisi {label} (DG{dg_num}) ---")
-                    self._print_hex("Hash Calcolato (Locale):", local_hash, Colors.YELLOW)
-                    self._print_hex("Hash nel SOD (Firmato): ", stored_hashes[dg_num], Colors.CYAN)
-                    
-                    if local_hash == stored_hashes[dg_num]:
-                        print(f"   ESITO: {Colors.GREEN}✔ MATCH (Dati Integri){Colors.ENDC}")
-                        return True
-                    else:
-                        print(f"   ESITO: {Colors.FAIL}✘ MISMATCH (Dati Manipolati){Colors.ENDC}")
-                        return False
-                return True
+            def audit_dg(num, path, name):
+                if num in stored_hashes:
+                    local_h = self._calc_hash(path, sod_algo_oid)
+                    is_valid = (stored_hashes[num] == local_h)
+                    self.report["integrity_check"][name] = {"match": is_valid}
+                    if is_valid: print(f"   DG{num} ({name}): {Colors.GREEN}MATCH{Colors.ENDC}")
+                    return is_valid
+                return False
 
-            d1_ok = check_dg(1, self.dg1_path, "Dati Anagrafici (MRZ)")
-            d2_ok = check_dg(2, self.dg2_path, "Foto Biometrica")
-            
-            if not (d1_ok and d2_ok): return
-
+            if not (audit_dg(1, self.dg1_path, "DG1") and audit_dg(2, self.dg2_path, "DG2")): return
         except Exception as e:
-            print(f"{Colors.FAIL}Errore Hash Check: {e}{Colors.ENDC}")
-            return
+            print(f"Errore Hash: {e}"); return
 
         # ---------------------------------------------------------
-        # STEP 2: VERIFICA FIRMA SOD
+        # STEP 2: FIRMA DIGITALE
         # ---------------------------------------------------------
-        print(f"\n{Colors.BLUE}{Colors.BOLD}[STEP 2] VERIFICA FIRMA DIGITALE SOD (Autenticità Documento){Colors.ENDC}")
+        print(f"\n{Colors.BLUE}{Colors.BOLD}[STEP 2] VERIFICA FIRMA SOD{Colors.ENDC}")
         try:
             certs = signed_data['certificates']
-            ds_cert_crypto = load_der_x509_certificate(certs[0].chosen.dump(), default_backend())
-            ds_pub_key = ds_cert_crypto.public_key()
-            
+            ds_cert = load_der_x509_certificate(certs[0].chosen.dump(), default_backend())
+            ds_pub = ds_cert.public_key()
             signer_info = signed_data['signer_infos'][0]
             signature = signer_info['signature'].native
             
-            # --- PROOF TECNICA PER IL PROF ---
-            print(f"   Estrazione Certificato Document Signer (DS)...")
-            print(f"   ► Soggetto: {Colors.CYAN}{ds_cert_crypto.subject.rfc4514_string()[:60]}...{Colors.ENDC}")
-            
-            # Mostriamo la chiave pubblica (imponente)
-            if isinstance(ds_pub_key, rsa.RSAPublicKey):
-                print(f"   ► Chiave Pubblica: {Colors.YELLOW}RSA {ds_pub_key.key_size} bit{Colors.ENDC}")
-                modulus_bytes = ds_pub_key.public_numbers().n.to_bytes((ds_pub_key.key_size + 7) // 8, 'big')
-                self._print_hex("► Modulo (snippet):", modulus_bytes, Colors.YELLOW)
-            
-            self._print_hex("► Firma Digitale SOD:", signature, Colors.MAGENTA)
-            
-            # Preparazione Payload
             raw_bytes = signer_info['signed_attrs'].dump()
-            payload_as_array = bytearray(raw_bytes)
-            if payload_as_array[0] == 0xA0: payload_as_array[0] = 0x31
-            payload_to_verify = bytes(payload_as_array)
+            payload = bytearray(raw_bytes)
+            if payload[0] == 0xA0: payload[0] = 0x31
+            payload_to_verify = bytes(payload)
             
-            # Algoritmo
-            sig_algo_oid = signer_info['digest_algorithm']['algorithm'].native
-            hash_algo_class = self.algo_map.get(sig_algo_oid, hashes.SHA256())
+            algo_oid = signer_info['digest_algorithm']['algorithm'].native
+            hash_cls = self.algo_map.get(algo_oid, hashes.SHA256())
 
-            print(f"   Verifica matematica firma ({sig_algo_oid} con PSS Salt 64)...")
-            
-            # VERIFICA
-            valid_sig = False
-            if isinstance(ds_pub_key, rsa.RSAPublicKey):
+            self.report["digital_signature"] = {
+                "serial_number": ds_cert.serial_number, # Importante per la CRL
+                "signature_valid": False
+            }
+
+            valid = False
+            if isinstance(ds_pub, rsa.RSAPublicKey):
                 try:
-                    ds_pub_key.verify(signature, payload_to_verify, 
-                        padding.PSS(mgf=padding.MGF1(hash_algo_class), salt_length=64), hash_algo_class)
-                    valid_sig = True
+                    ds_pub.verify(signature, payload_to_verify, padding.PSS(mgf=padding.MGF1(hash_cls), salt_length=64), hash_cls)
+                    valid = True
                 except:
-                    # Fallback auto
-                     ds_pub_key.verify(signature, payload_to_verify, 
-                        padding.PSS(mgf=padding.MGF1(hash_algo_class), salt_length=padding.PSS.AUTO), hash_algo_class)
-                     valid_sig = True
+                     try:
+                        ds_pub.verify(signature, payload_to_verify, padding.PSS(mgf=padding.MGF1(hash_cls), salt_length=padding.PSS.AUTO), hash_cls)
+                        valid = True
+                     except: pass
+            elif isinstance(ds_pub, ec.EllipticCurvePublicKey):
+                 try:
+                    ds_pub.verify(signature, payload_to_verify, ec.ECDSA(hash_cls))
+                    valid = True
+                 except: pass
 
-            if valid_sig:
-                print(f"   ESITO: {Colors.GREEN}✔ FIRMA VALIDA (Il SOD è autentico){Colors.ENDC}")
-            
+            self.report["digital_signature"]["signature_valid"] = valid
+            if valid: print(f"   Firma SOD: {Colors.GREEN}VALIDA{Colors.ENDC}")
+
         except Exception as e:
-            print(f"{Colors.FAIL}Errore Step 2: {e}{Colors.ENDC}")
-            return
+            print(f"Errore Firma: {e}"); return
 
         # ---------------------------------------------------------
         # STEP 3: CHAIN OF TRUST
         # ---------------------------------------------------------
-        print(f"\n{Colors.BLUE}{Colors.BOLD}[STEP 3] CHAIN OF TRUST (Verifica Autorità CSCA){Colors.ENDC}")
+        print(f"\n{Colors.BLUE}{Colors.BOLD}[STEP 3] CHAIN OF TRUST (CSCA){Colors.ENDC}")
+        ds_issuer = ds_cert.issuer
         
-        ds_issuer = ds_cert_crypto.issuer
-        print(f"   Emittente DS cercato: {ds_issuer.rfc4514_string()[:50]}...")
+        self.report["chain_of_trust"] = {"csca_found": False, "chain_valid": False}
         
-        found_valid_csca = False
-        csca_files = [f for f in os.listdir(self.csca_folder) if f.lower().endswith(('.cer','.crt','.pem'))]
+        # A. Cerca Certificato CSCA
+        if os.path.exists(self.csca_folder):
+            for f_name in os.listdir(self.csca_folder):
+                if not f_name.lower().endswith('.cer'): continue
+                try:
+                    with open(os.path.join(self.csca_folder, f_name), 'rb') as f: data = f.read()
+                    try: csca = load_pem_x509_certificate(data, default_backend())
+                    except: csca = load_der_x509_certificate(data, default_backend())
+                    
+                    if csca.subject == ds_issuer:
+                        csca_pub = csca.public_key()
+                        check_hash = hashes.SHA512() if "sha512" in algo_oid else hashes.SHA256()
+                        try:
+                            if isinstance(csca_pub, rsa.RSAPublicKey):
+                                csca_pub.verify(ds_cert.signature, ds_cert.tbs_certificate_bytes, padding.PSS(mgf=padding.MGF1(check_hash), salt_length=64), check_hash)
+                                self.report["chain_of_trust"] = {"csca_found": True, "filename": f_name, "chain_valid": True}
+                                print(f"   CSCA Trovato: {Colors.GREEN}{f_name}{Colors.ENDC}")
+                                break
+                        except: pass
+                except: continue
+
+        # ---------------------------------------------------------
+        # STEP 4: CONTROLLO CRL (REVOCATION CHECK) - NUOVO!
+        # ---------------------------------------------------------
+        print(f"\n{Colors.BLUE}{Colors.BOLD}[STEP 4] CONTROLLO REVOCA (CRL){Colors.ENDC}")
         
-        for c_file in csca_files:
+        if os.path.exists(self.crl_path):
             try:
-                path = os.path.join(self.csca_folder, c_file)
-                with open(path, 'rb') as f: data = f.read()
-                try: csca = load_pem_x509_certificate(data, default_backend())
-                except: csca = load_der_x509_certificate(data, default_backend())
-
-                if csca.subject == ds_issuer:
-                    print(f"   🔎 Analisi candidato: {Colors.BOLD}{c_file}{Colors.ENDC}")
-                    csca_pub = csca.public_key()
+                with open(self.crl_path, "rb") as f: crl_data = f.read()
+                # Carica CRL (Tenta PEM poi DER)
+                try: crl = load_pem_x509_crl(crl_data, default_backend())
+                except: crl = load_der_x509_crl(crl_data, default_backend())
+                
+                print(f"   Analisi CRL emessa da: {crl.issuer.rfc4514_string()[:50]}...")
+                
+                # Check Serial Number
+                ds_serial = ds_cert.serial_number
+                print(f"   Cerco Serial Number DS: {Colors.YELLOW}{ds_serial}{Colors.ENDC}")
+                
+                revoked_entry = crl.get_revoked_certificate_by_serial_number(ds_serial)
+                
+                if revoked_entry is not None:
+                    print(f"   STATO: {Colors.FAIL}REVOCATO!{Colors.ENDC} (Data: {revoked_entry.revocation_date})")
+                    self.report["revocation_status"] = "REVOKED"
+                else:
+                    print(f"   STATO: {Colors.GREEN}NON REVOCATO (Valido){Colors.ENDC}")
+                    self.report["revocation_status"] = "OK"
                     
-                    # Calcolo fingerprint per scena
-                    fp = csca.fingerprint(hashes.SHA256()).hex().upper()
-                    print(f"      Fingerprint CSCA: {fp[:30]}...")
+            except Exception as e:
+                print(f"   {Colors.WARNING}Impossibile leggere CRL: {e}{Colors.ENDC}")
+                self.report["revocation_status"] = "ERROR_READING_CRL"
+        else:
+            print(f"   {Colors.WARNING}File CRL non trovato: {self.crl_path}{Colors.ENDC}")
+            self.report["revocation_status"] = "CRL_MISSING"
 
-                    # Setup verifica
-                    check_hash = hashes.SHA512() if "sha512" in sig_algo_oid else hashes.SHA256()
-                    
-                    try:
-                        if isinstance(csca_pub, rsa.RSAPublicKey):
-                            csca_pub.verify(ds_cert_crypto.signature, ds_cert_crypto.tbs_certificate_bytes,
-                                padding.PSS(mgf=padding.MGF1(check_hash), salt_length=64), check_hash)
-                            print(f"      Verifica Firma DS: {Colors.GREEN}✔ OK (Catena Validata){Colors.ENDC}")
-                            found_valid_csca = True
-                            break
-                    except: pass # Prova prossimo
-            except: continue
+        # VERDETTO FINALE (Include CRL Check)
+        is_clean = (self.report["integrity_check"].get("DG1", {}).get("match") and 
+                    self.report["digital_signature"].get("signature_valid") and 
+                    self.report["chain_of_trust"].get("chain_valid") and
+                    self.report["revocation_status"] == "OK") # <--- Importante!
+        
+        self.report["final_verdict"] = "AUTHENTIC" if is_clean else "FAILED"
 
         print("\n" + "="*60)
-        if found_valid_csca:
-            print(f"{Colors.GREEN}{Colors.BOLD}   RISULTATO FINALE: PASSAPORTO VALIDO E AUTENTICO{Colors.ENDC}")
-        else:
-            print(f"{Colors.WARNING}   RISULTATO: PASSAPORTO INTEGRO (CSCA mancante){Colors.ENDC}")
-        print("="*60 + "\n")
+        print(f"{Colors.YELLOW}REPORT STRUTTURATO:{Colors.ENDC}")
+        print(json.dumps(self.report, indent=4))
+        print("="*60)
 
 if __name__ == "__main__":
+    # Aggiorna il percorso della CRL qui sotto!
     v = PassiveValidator(
         dg1_path="../FILE/YC60963196ITA7005107M3407149<<<<<<<<<<<<<<02-DG1.bin", 
         dg2_path="../FILE/YC60963196ITA7005107M3407149<<<<<<<<<<<<<<02-DG2.bin", 
         sod_path="../FILE/YC60963196ITA7005107M3407149<<<<<<<<<<<<<<02-SOD.bin", 
-        csca_folder="../certs" 
+        csca_folder="../certs",
+        crl_path="../certs/CRL_CSCA.crl" # <--- PUNTA AL TUO FILE CRL SCARICATO
     )
     v.run()
