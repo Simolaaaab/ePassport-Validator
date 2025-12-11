@@ -36,6 +36,13 @@ class PassiveValidator:
             'sha256': hashes.SHA256(),
             'sha384': hashes.SHA384(),
             'sha512': hashes.SHA512(),
+
+            # OID Numerici (quello che ti mancava!)
+            '1.3.14.3.2.26': hashes.SHA1(),
+            '2.16.840.1.101.3.4.2.1': hashes.SHA256(),
+            '2.16.840.1.101.3.4.2.2': hashes.SHA384(),
+            '2.16.840.1.101.3.4.2.3': hashes.SHA512(), # <--- Ecco il tuo colpevole!
+            '2.16.840.1.101.3.4.2.4': hashes.SHA224(),
         }
 
     def _calc_hash(self, file_path, algo_name):
