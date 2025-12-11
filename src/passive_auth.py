@@ -6,12 +6,14 @@ from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509 import load_pem_x509_certificate, load_der_x509_certificate
 
-# --- COLORI PER LA CONSOLE (Effetto "Hacker") ---
+# --- COLORI PER LA CONSOLE (Corretti e Completi) ---
 class Colors:
     HEADER = '\033[95m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
     GREEN = '\033[92m'
+    YELLOW = '\033[93m'   # <--- AGGIUNTO
+    MAGENTA = '\033[95m'  # <--- AGGIUNTO
     WARNING = '\033[93m'
     FAIL = '\033[91m'
     ENDC = '\033[0m'
@@ -51,6 +53,9 @@ class PassiveValidator:
 
     def _print_hex(self, label, data, color=Colors.CYAN):
         """Stampa carina di dati esadecimali"""
+        if data is None:
+            print(f"   {label:<25} {Colors.FAIL}NONE{Colors.ENDC}")
+            return
         hex_str = data.hex().upper()
         # Taglia se troppo lungo per la console
         short_hex = hex_str[:32] + "..." if len(hex_str) > 32 else hex_str
