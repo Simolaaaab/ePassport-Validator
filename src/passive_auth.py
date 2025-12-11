@@ -246,6 +246,7 @@ class PassiveValidator:
         except Exception as e:
             print(f"❌ Firma SOD NON VALIDA. Motivo esatto:\n   {e}")
             return
+        sig_algo = signer_info['digest_algorithm']['algorithm'].native
 
         # ---------------------------------------------------------
         # STEP 3: CHAIN OF TRUST (CSCA)
