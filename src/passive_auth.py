@@ -194,10 +194,12 @@ class PassiveValidator:
                 hash_algo_class = hashes.SHA256() # Fallback
 
             # E. Verifica Matematica
+            # E. Verifica Matematica
+            print(f"   [INFO] Tentativo verifica firma con algoritmo: {sig_algo}")
             try:
-                # --- SUPPORTO ECDSA (IMPORTANTE PER SHA-512) ---
+                # --- SUPPORTO ECDSA ---
                 if isinstance(ds_pub_key, ec.EllipticCurvePublicKey):
-                    print("   [INFO] Chiave pubblica è ECDSA (Elliptic Curve)")
+                    print("   [INFO] Chiave pubblica è ECDSA")
                     ds_pub_key.verify(
                         signature, 
                         payload_to_verify, 
@@ -205,26 +207,45 @@ class PassiveValidator:
                     )
                     print("✅ Firma SOD (ECDSA): VALIDA")
 
-                # --- SUPPORTO RSA ---
+                # --- SUPPORTO RSA (MODIFICATO PER TE) ---
                 elif isinstance(ds_pub_key, rsa.RSAPublicKey):
-                    print("   [INFO] Chiave pubblica è RSA")
+                    print("   [INFO] Chiave pubblica è RSA. Tento diverse configurazioni...")
+                    
+                    # TENTATIVO 1: RSA-PSS con Salt AUTO (Il più probabile per SHA-512)
                     try:
-                        # Tentativo 1: PSS (Più comune nei passaporti nuovi)
                         ds_pub_key.verify(
                             signature, 
                             payload_to_verify, 
-                            padding.PSS(mgf=padding.MGF1(hash_algo_class), salt_length=padding.PSS.MAX_LENGTH),
+                            padding.PSS(mgf=padding.MGF1(hash_algo_class), salt_length=padding.PSS.AUTO),
                             hash_algo_class
                         )
-                        print("✅ Firma SOD (RSA PSS): VALIDA")
-                    except Exception as e_pss:
-                        # Tentativo 2: PKCS1 v1.5 (Passaporti vecchi)
-                        ds_pub_key.verify(signature, payload_to_verify, padding.PKCS1v15(), hash_algo_class)
-                        print("✅ Firma SOD (RSA PKCS#1 v1.5): VALIDA")
+                        print("✅ Firma SOD (RSA PSS - Auto Salt): VALIDA")
+                    except Exception as e1:
+                        print(f"   [Debug] PSS Auto fallito ({e1}). Tento MAX_LENGTH...")
+                        
+                        # TENTATIVO 2: RSA-PSS con Salt MAX_LENGTH
+                        try:
+                             ds_pub_key.verify(
+                                signature, 
+                                payload_to_verify, 
+                                padding.PSS(mgf=padding.MGF1(hash_algo_class), salt_length=padding.PSS.MAX_LENGTH),
+                                hash_algo_class
+                            )
+                             print("✅ Firma SOD (RSA PSS - Max Salt): VALIDA")
+                        except Exception as e2:
+                            print(f"   [Debug] PSS Max fallito ({e2}). Tento PKCS1 v1.5...")
+                            
+                            # TENTATIVO 3: PKCS1 v1.5 (Vecchio standard)
+                            ds_pub_key.verify(signature, payload_to_verify, padding.PKCS1v15(), hash_algo_class)
+                            print("✅ Firma SOD (RSA PKCS#1 v1.5): VALIDA")
             
             except Exception as e:
-                print(f"❌ Firma SOD NON VALIDA. Motivo esatto:\n   {e}")
+                print(f"❌ Firma SOD NON VALIDA. Tutti i tentativi falliti.")
+                print(f"   Ultimo errore: {e}")
                 return
+        except Exception as e:
+            print(f"❌ Firma SOD NON VALIDA. Motivo esatto:\n   {e}")
+            return
 
         # ---------------------------------------------------------
         # STEP 3: CHAIN OF TRUST (CSCA)
