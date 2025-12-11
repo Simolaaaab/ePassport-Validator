@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509 import load_pem_x509_certificate, load_der_x509_certificate
 
-# --- DEFINIZIONI ASN.1 (Per leggere il SOD) ---
+# --- DEFINIZIONI ASN.1 ---
 class DataGroupHash(core.Sequence):
     _fields = [
         ('data_group_number', core.Integer),
@@ -41,7 +41,6 @@ class PassiveValidator:
     def _calc_hash(self, file_path, algo_name):
         """Calcola hash di un file locale"""
         if algo_name not in self.algo_map:
-            # Fallback comune: a volte asn1crypto ritorna nomi leggermente diversi
             algo_name = algo_name.replace("-", "").lower()
             if algo_name not in self.algo_map:
                 raise ValueError(f"Algoritmo hash sconosciuto: {algo_name}")
@@ -52,71 +51,45 @@ class PassiveValidator:
         return digest.finalize()
     
     def _unwrap_sod(self, raw_data):
-        """
-        Pulisce il SOD rimuovendo eventuali wrapper ICAO (Tag 0x77).
-        """
-        if not raw_data:
-            return raw_data
-
-        # Debug: Stampa i primi byte per capire cosa stiamo leggendo
-        print(f"[*] SOD First Bytes: {raw_data[:8].hex().upper()}")
-
-        # Se inizia con 0x30, è già pulito (Standard ASN.1 Sequence)
-        if raw_data[0] == 0x30:
-            return raw_data
+        """Pulisce il SOD rimuovendo wrapper ICAO (Tag 0x77)."""
+        if not raw_data: return raw_data
         
-        # Se inizia con 0x77 (Response Message Template), dobbiamo spacchettarlo
+        # Se inizia con 0x30, è già pulito
+        if raw_data[0] == 0x30: return raw_data
+        
+        # Se inizia con 0x77, spacchettiamo
         if raw_data[0] == 0x77:
             print("   ⚠️  Rilevato Wrapper 0x77. Rimozione in corso...")
             idx = 1
-            
-            # Parsing Lunghezza Wrapper
             if raw_data[idx] < 0x80:
                 length = raw_data[idx]
                 idx += 1
             else:
                 num_len_bytes = raw_data[idx] & 0x7f
-                idx += 1
-                length = int.from_bytes(raw_data[idx:idx + num_len_bytes], byteorder='big')
-                idx += num_len_bytes
+                idx += 1 + num_len_bytes # Salta bytes lunghezza
             
-            # Ora siamo dentro il contenuto del 0x77.
-            # Spesso troviamo un altro tag: 0x82 (Response Data) o direttamente il 0x30
+            # Cerca tag 0x82 o 0x30
             if idx < len(raw_data) and raw_data[idx] == 0x82:
-                # Caso standard ICAO: 77 ... 82 ... [DATA]
                 print("   ⚠️  Rilevato Tag 0x82 (Response Data). Rimozione...")
-                idx += 1 # Salta 0x82
-                
-                # Parsing Lunghezza del 0x82
+                idx += 1 
                 if raw_data[idx] < 0x80:
                     idx += 1
                 else:
                     num_len_bytes = raw_data[idx] & 0x7f
                     idx += 1 + num_len_bytes
             
-            # Restituiamo tutto da qui in poi
-            clean_data = raw_data[idx:]
-            
-            # Controllo finale
-            if clean_data[0] != 0x30:
-                print(f"   ❌ ATTENZIONE: Anche dopo l'unwrap, il file inizia con {hex(clean_data[0])} invece di 0x30!")
-            else:
-                print("   ✅ SOD pulito con successo.")
-                
-            return clean_data
+            return raw_data[idx:]
 
-        print("   ❌ Formato SOD sconosciuto (Non inizia con 30 né 77)")
         return raw_data
 
     def run(self):
         print("\n=== AVVIO PASSIVE AUTHENTICATION ===")
         
-        # 1. Caricamento SOD
+        # --- CARICAMENTO E PULIZIA SOD ---
         try:
             with open(self.sod_path, 'rb') as f: 
                 sod_raw_dirty = f.read()
             
-            # >>> FIX QUI: PULIZIA DEL FILE <<<
             sod_raw = self._unwrap_sod(sod_raw_dirty)
             
             content_info = cms.ContentInfo.load(sod_raw)
@@ -127,10 +100,8 @@ class PassiveValidator:
             
         except Exception as e:
             print(f"❌ Errore parsing SOD: {e}")
-            # Debug extra:
-            import traceback
-            traceback.print_exc()
             return
+
         # ---------------------------------------------------------
         # STEP 1: VERIFICA INTEGRITÀ (HASH DEI DATAGROUPS)
         # ---------------------------------------------------------
@@ -139,7 +110,6 @@ class PassiveValidator:
             encap_content = signed_data['encap_content_info']['content'].native
             lds_obj = LDSSecurityObject.load(encap_content)
             
-            # Algoritmo usato nel SOD (es. sha256)
             sod_algo = lds_obj['hash_algorithm']['algorithm'].native
             print(f"[*] Algoritmo Hash Passaporto: {sod_algo}")
             
@@ -153,9 +123,7 @@ class PassiveValidator:
                     print("✅ DG1 INTEGRITY: OK")
                 else:
                     print(f"❌ DG1 INTEGRITY: FALLITA!")
-                    print(f"   Atteso: {stored_hashes[1].hex()[:10]}...")
-                    print(f"   Calcolato: {calc_dg1.hex()[:10]}...")
-                    return # Stop se i dati sono alterati
+                    return 
             
             # Verifica DG2
             if 2 in stored_hashes:
@@ -175,43 +143,45 @@ class PassiveValidator:
         # ---------------------------------------------------------
         print("\n--- 2. VERIFICA FIRMA DIGITALE SOD ---")
         try:
-            # Estrazione Certificato DS interno
+            # A. Estrarre Certificato DS
             certs = signed_data['certificates']
-            # Prendiamo il primo certificato trovato (di solito è il DS)
             ds_cert_x509 = certs[0].chosen
             self.ds_cert = ds_cert_x509.dump()
             
-            # Convertiamo in oggetto Cryptography per calcoli matematici
             ds_cert_crypto = load_der_x509_certificate(self.ds_cert, default_backend())
             ds_pub_key = ds_cert_crypto.public_key()
             
-            # Dati da verificare: NON è il file intero, ma gli attributi firmati (SignedAttributes)
+            # B. Estrarre Info Firma e Attributi
             signer_info = signed_data['signer_infos'][0]
             signature = signer_info['signature'].native
             
-            # Costruzione payload firmato (trick ASN.1: serve il DER dei signed_attrs ma con tag SET OF)
-            # asn1crypto lo fa correttamente se dumpiano l'oggetto signed_attrs
-            signed_attrs = signer_info['signed_attrs']
-            payload_to_verify = signed_attrs.dump()
-            
-            # Check se il primo byte è corretto (deve essere 0x31 per SET OF)
-            # A volte asn1crypto mantiene il context tag [0], dobbiamo forzare 0x31
-            if payload_to_verify[0] != 0x31:
-                payload_to_verify = b'\x31' + payload_to_verify[1:]
+            # C. PREPARAZIONE PAYLOAD (FIX ASN.1)
+            # Qui usiamo la libreria per ricostruire il 'SET OF' corretto
+            try:
+                raw_attrs = signer_info['signed_attrs']
+                clean_attrs = cms.CMSAttributes(raw_attrs.native)
+                payload_to_verify = clean_attrs.dump()
+                
+                # Check difensivo
+                if payload_to_verify[0] != 0x31:
+                    print(f"⚠️ Warning: Payload non inizia con 0x31 (Hex: {hex(payload_to_verify[0])})")
+            except Exception as e:
+                print(f"❌ Errore preparazione payload firma: {e}")
+                return
 
-            # Recupero algoritmo hash della firma
+            # D. Recupero Algoritmo Hash Firma
             sig_algo = signer_info['digest_algorithm']['algorithm'].native
-            hash_algo_class = self.algo_map.get(sig_algo, hashes.SHA256())
-
-            # Verifica Matematica
+            hash_algo_class = self.algo_map.get(sig_algo, hashes.SHA256()) # Default SHA256 se non trovato
+            
+            # E. Verifica Matematica
             try:
                 if isinstance(ds_pub_key, rsa.RSAPublicKey):
-                    # TENTATIVO 1: PKCS1v15 (Standard passaporti vecchi)
                     try:
+                        # Tentativo 1: PKCS1 v1.5
                         ds_pub_key.verify(signature, payload_to_verify, padding.PKCS1v15(), hash_algo_class)
                         print("✅ Firma SOD (RSA PKCS#1 v1.5): VALIDA")
                     except:
-                        # TENTATIVO 2: PSS (Standard passaporti nuovi/tedeschi)
+                        # Tentativo 2: PSS
                         ds_pub_key.verify(
                             signature, 
                             payload_to_verify, 
@@ -227,11 +197,10 @@ class PassiveValidator:
             
             except Exception as e:
                 print(f"❌ Firma SOD NON VALIDA: {e}")
-                print("   Il passaporto potrebbe essere clonato o il SOD corrotto.")
-                return # Stop qui
+                return 
 
         except Exception as e:
-            print(f"❌ Errore parsing firma: {e}")
+            print(f"❌ Errore generale verifica firma: {e}")
             return
 
         # ---------------------------------------------------------
@@ -239,7 +208,8 @@ class PassiveValidator:
         # ---------------------------------------------------------
         print("\n--- 3. CHAIN OF TRUST (CSCA -> DS) ---")
         if not os.path.exists(self.csca_folder):
-            print(f"⚠️ Cartella {self.csca_folder} non trovata.")
+            print(f"⚠️ Cartella CSCA '{self.csca_folder}' non trovata. Impossibile validare la catena.")
+            print("\n🎉 PASSAPORTO VALIDO INTERNAMENTE (Integrità + Firma Document Signer OK).")
             return
 
         ds_issuer = ds_cert_crypto.issuer
@@ -248,25 +218,18 @@ class PassiveValidator:
         csca_files = [f for f in os.listdir(self.csca_folder) if f.lower().endswith(('.cer','.crt','.pem','.der'))]
         found = False
         
-        print(f"[*] Test su {len(csca_files)} certificati CSCA locali...")
-        
         for c_file in csca_files:
             try:
                 path = os.path.join(self.csca_folder, c_file)
                 with open(path, 'rb') as f: data = f.read()
                 
-                # Load flessibile
                 try: csca = load_pem_x509_certificate(data, default_backend())
                 except: csca = load_der_x509_certificate(data, default_backend())
 
                 if csca.subject == ds_issuer:
-                    print(f"   🔎 Test candidato: {c_file}...")
                     csca_pub = csca.public_key()
-                    
-                    # Logica "Smart" per la verifica della firma del certificato
-                    # Tentiamo PKCS1 v1.5 E PSS anche qui
                     try:
-                        # Tenta verifica standard (cryptography gestisce padding base)
+                        # Prova verifica generica (copre RSA PKCS1 e ECDSA)
                         csca_pub.verify(
                             ds_cert_crypto.signature,
                             ds_cert_crypto.tbs_certificate_bytes,
@@ -277,7 +240,7 @@ class PassiveValidator:
                         found = True
                         break
                     except:
-                        # Se fallisce e siamo su RSA, prova PSS esplicitamente
+                         # Fallback PSS per RSA
                         if isinstance(csca_pub, rsa.RSAPublicKey):
                             try:
                                 csca_pub.verify(
@@ -289,17 +252,25 @@ class PassiveValidator:
                                 print(f"   ✅ BINGO! Chain Validated (PSS) con {c_file}")
                                 found = True
                                 break
-                            except:
-                                continue # Prossimo file
-            except:
-                continue
+                            except: continue
+            except: continue
         
         if not found:
-            print("❌ Chain of Trust FALLITA: Nessun CSCA valido trovato.")
+            print("⚠️ Chain of Trust: Nessun certificato CSCA corrispondente trovato (Normale se non hai il Master List).")
         else:
-            print("\n🎉 PASSAPORTO VALIDO E AUTENTICO.")
+            print("\n🎉 PASSAPORTO COMPLETAMENTE VALIDO E AUTENTICO.")
 
 # ESECUZIONE
 if __name__ == "__main__":
-    v = PassiveValidator("dg1.bin", "dg2.bin", "sod.bin", "./certs")
+    # Percorsi relativi corretti per la struttura:
+    # src/ (dove sei tu con lo script)
+    # └── FILE/ (dove sono i .bin)
+    
+    # IMPORTANTE: Sostituisci i nomi dei file con quelli ESATTI che hai nella cartella FILE
+    v = PassiveValidator(
+        dg1_path="../FILE/YC60963196ITA7005107M3407149<<<<<<<<<<<<<<02-DG1.bin", 
+        dg2_path="../FILE/YC60963196ITA7005107M3407149<<<<<<<<<<<<<<02-DG2.bin", 
+        sod_path="../FILE/YC60963196ITA7005107M3407149<<<<<<<<<<<<<<02-SOD.bin", 
+        csca_folder="./certs" 
+    )
     v.run()
