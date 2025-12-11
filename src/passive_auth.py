@@ -162,33 +162,54 @@ class PassiveValidator:
             signer_info = signed_data['signer_infos'][0]
             signature = signer_info['signature'].native
             
-            # C. PREPARAZIONE PAYLOAD (FIX ASN.1)
-            # Qui usiamo la libreria per ricostruire il 'SET OF' corretto
             try:
-                raw_attrs = signer_info['signed_attrs']
-                clean_attrs = cms.CMSAttributes(raw_attrs.native)
-                payload_to_verify = clean_attrs.dump()
+                # 1. Ottieni i byte originali "sporchi" (con tag [0] implicit)
+                raw_bytes = signer_info['signed_attrs'].dump()
                 
-                # Check difensivo
-                if payload_to_verify[0] != 0x31:
-                    print(f"⚠️ Warning: Payload non inizia con 0x31 (Hex: {hex(payload_to_verify[0])})")
+                # 2. Converti in array modificabile
+                payload_as_array = bytearray(raw_bytes)
+                
+                # 3. Il primo byte è il Tag. Nel SOD è 0xA0 (Context [0]).
+                #    Per la verifica serve 0x31 (SET OF).
+                #    Cambiamo solo quello, mantenendo lunghezza e contenuto IDENTICI.
+                if payload_as_array[0] == 0xA0:
+                    payload_as_array[0] = 0x31
+                    payload_to_verify = bytes(payload_as_array)
+                    print(f"   [DEBUG] Payload corretto: Tag cambiato da A0 a 31")
+                else:
+                    # Se per qualche motivo asn1crypto lo ha già normalizzato
+                    print(f"   [DEBUG] Payload già standard (Tag: {hex(payload_as_array[0])})")
+                    payload_to_verify = raw_bytes
+
             except Exception as e:
                 print(f"❌ Errore preparazione payload firma: {e}")
                 return
 
             # D. Recupero Algoritmo Hash Firma
-            sig_algo = signer_info['digest_algorithm']['algorithm'].native
-            hash_algo_class = self.algo_map.get(sig_algo, hashes.SHA256()) # Default SHA256 se non trovato
-            
+            try:
+                sig_algo_oid = signer_info['digest_algorithm']['algorithm'].native
+                print(f"   [DEBUG] Algoritmo Hash Firma: {sig_algo_oid}")
+                hash_algo_class = self.algo_map.get(sig_algo_oid, hashes.SHA256()) 
+            except:
+                hash_algo_class = hashes.SHA256() # Fallback
+
             # E. Verifica Matematica
             try:
-                if isinstance(ds_pub_key, rsa.RSAPublicKey):
+                # --- SUPPORTO ECDSA (IMPORTANTE PER SHA-512) ---
+                if isinstance(ds_pub_key, ec.EllipticCurvePublicKey):
+                    print("   [INFO] Chiave pubblica è ECDSA (Elliptic Curve)")
+                    ds_pub_key.verify(
+                        signature, 
+                        payload_to_verify, 
+                        ec.ECDSA(hash_algo_class)
+                    )
+                    print("✅ Firma SOD (ECDSA): VALIDA")
+
+                # --- SUPPORTO RSA ---
+                elif isinstance(ds_pub_key, rsa.RSAPublicKey):
+                    print("   [INFO] Chiave pubblica è RSA")
                     try:
-                        # Tentativo 1: PKCS1 v1.5
-                        ds_pub_key.verify(signature, payload_to_verify, padding.PKCS1v15(), hash_algo_class)
-                        print("✅ Firma SOD (RSA PKCS#1 v1.5): VALIDA")
-                    except:
-                        # Tentativo 2: PSS
+                        # Tentativo 1: PSS (Più comune nei passaporti nuovi)
                         ds_pub_key.verify(
                             signature, 
                             payload_to_verify, 
@@ -196,19 +217,14 @@ class PassiveValidator:
                             hash_algo_class
                         )
                         print("✅ Firma SOD (RSA PSS): VALIDA")
-                
-                elif isinstance(ds_pub_key, ec.EllipticCurvePublicKey):
-                    # ECDSA
-                    ds_pub_key.verify(signature, payload_to_verify, ec.ECDSA(hash_algo_class))
-                    print("✅ Firma SOD (ECDSA): VALIDA")
+                    except Exception as e_pss:
+                        # Tentativo 2: PKCS1 v1.5 (Passaporti vecchi)
+                        ds_pub_key.verify(signature, payload_to_verify, padding.PKCS1v15(), hash_algo_class)
+                        print("✅ Firma SOD (RSA PKCS#1 v1.5): VALIDA")
             
             except Exception as e:
-                print(f"❌ Firma SOD NON VALIDA: {e}")
-                return 
-
-        except Exception as e:
-            print(f"❌ Errore generale verifica firma: {e}")
-            return
+                print(f"❌ Firma SOD NON VALIDA. Motivo esatto:\n   {e}")
+                return
 
         # ---------------------------------------------------------
         # STEP 3: CHAIN OF TRUST (CSCA)
