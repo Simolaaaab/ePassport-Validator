@@ -220,6 +220,13 @@ def main():
     else:
         print("❌ DG1 non letto.")
 
+    data2 = sc.read_file_sfi(2)
+    if data2:
+        with open("dg2.bin", "wb") as f: f.write(data2)
+        print(f"✅ DG2 Salvato ({len(data2)} bytes)")
+    else:
+        print("❌ DG2 non letto.")
+
     # SOD -> SFI = 29 (0x1D)
     data = sc.read_file_sfi(29)
     if data:
