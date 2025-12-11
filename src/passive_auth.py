@@ -50,22 +50,87 @@ class PassiveValidator:
         with open(file_path, "rb") as f:
             digest.update(f.read())
         return digest.finalize()
+    
+    def _unwrap_sod(self, raw_data):
+        """
+        Pulisce il SOD rimuovendo eventuali wrapper ICAO (Tag 0x77).
+        """
+        if not raw_data:
+            return raw_data
+
+        # Debug: Stampa i primi byte per capire cosa stiamo leggendo
+        print(f"[*] SOD First Bytes: {raw_data[:8].hex().upper()}")
+
+        # Se inizia con 0x30, è già pulito (Standard ASN.1 Sequence)
+        if raw_data[0] == 0x30:
+            return raw_data
+        
+        # Se inizia con 0x77 (Response Message Template), dobbiamo spacchettarlo
+        if raw_data[0] == 0x77:
+            print("   ⚠️  Rilevato Wrapper 0x77. Rimozione in corso...")
+            idx = 1
+            
+            # Parsing Lunghezza Wrapper
+            if raw_data[idx] < 0x80:
+                length = raw_data[idx]
+                idx += 1
+            else:
+                num_len_bytes = raw_data[idx] & 0x7f
+                idx += 1
+                length = int.from_bytes(raw_data[idx:idx + num_len_bytes], byteorder='big')
+                idx += num_len_bytes
+            
+            # Ora siamo dentro il contenuto del 0x77.
+            # Spesso troviamo un altro tag: 0x82 (Response Data) o direttamente il 0x30
+            if idx < len(raw_data) and raw_data[idx] == 0x82:
+                # Caso standard ICAO: 77 ... 82 ... [DATA]
+                print("   ⚠️  Rilevato Tag 0x82 (Response Data). Rimozione...")
+                idx += 1 # Salta 0x82
+                
+                # Parsing Lunghezza del 0x82
+                if raw_data[idx] < 0x80:
+                    idx += 1
+                else:
+                    num_len_bytes = raw_data[idx] & 0x7f
+                    idx += 1 + num_len_bytes
+            
+            # Restituiamo tutto da qui in poi
+            clean_data = raw_data[idx:]
+            
+            # Controllo finale
+            if clean_data[0] != 0x30:
+                print(f"   ❌ ATTENZIONE: Anche dopo l'unwrap, il file inizia con {hex(clean_data[0])} invece di 0x30!")
+            else:
+                print("   ✅ SOD pulito con successo.")
+                
+            return clean_data
+
+        print("   ❌ Formato SOD sconosciuto (Non inizia con 30 né 77)")
+        return raw_data
 
     def run(self):
         print("\n=== AVVIO PASSIVE AUTHENTICATION ===")
         
         # 1. Caricamento SOD
         try:
-            with open(self.sod_path, 'rb') as f: sod_raw = f.read()
+            with open(self.sod_path, 'rb') as f: 
+                sod_raw_dirty = f.read()
+            
+            # >>> FIX QUI: PULIZIA DEL FILE <<<
+            sod_raw = self._unwrap_sod(sod_raw_dirty)
+            
             content_info = cms.ContentInfo.load(sod_raw)
             if content_info['content_type'].native != 'signed_data':
                 print("❌ Errore: Il SOD non è un SignedData.")
                 return
             signed_data = content_info['content']
+            
         except Exception as e:
             print(f"❌ Errore parsing SOD: {e}")
+            # Debug extra:
+            import traceback
+            traceback.print_exc()
             return
-
         # ---------------------------------------------------------
         # STEP 1: VERIFICA INTEGRITÀ (HASH DEI DATAGROUPS)
         # ---------------------------------------------------------
